@@ -46,7 +46,8 @@ BROTLI_ENC_C = \
   c/enc/memory.c \
   c/enc/metablock.c \
   c/enc/static_dict.c \
-  c/enc/utf8_util.c
+  c/enc/utf8_util.c \
+  c/enc/rax/rax.c
 
 BROTLI_ENC_H = \
   c/enc/backward_references.h \
@@ -90,7 +91,10 @@ BROTLI_ENC_H = \
   c/enc/static_dict.h \
   c/enc/static_dict_lut.h \
   c/enc/utf8_util.h \
-  c/enc/write_bits.h
+  c/enc/write_bits.h \
+  c/enc/reduced_dict.h \
+  c/enc/rax/rax.h \
+  c/enc/rax/rax_malloc.h
 
 BROTLI_INCLUDE = \
   c/include/brotli/decode.h \

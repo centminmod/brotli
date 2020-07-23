@@ -229,6 +229,15 @@ typedef enum BrotliEncoderParameter {
 typedef struct BrotliEncoderStateStruct BrotliEncoderState;
 
 /**
+ * Opaque structure that holds dictionary data.
+ *
+ * Allocated and initialized with ::BrotliEncoderLoadDict or
+ * ::BrotliEncoderGenerateDict.
+ * Cleaned up and deallocated with ::BrotliEncoderDestroyDict.
+ */
+typedef struct BrotliEncoderExternalDict BrotliEncoderDict;
+
+/**
  * Sets the specified parameter to the given encoder instance.
  *
  * @param state encoder instance
@@ -265,7 +274,7 @@ BROTLI_ENC_API BrotliEncoderState* BrotliEncoderCreateInstance(
 /**
  * Deinitializes and frees ::BrotliEncoderState instance.
  *
- * @param state decoder instance to be cleaned up and deallocated
+ * @param state encoder instance to be cleaned up and deallocated
  */
 BROTLI_ENC_API void BrotliEncoderDestroyInstance(BrotliEncoderState* state);
 
@@ -440,6 +449,115 @@ BROTLI_ENC_API const uint8_t* BrotliEncoderTakeOutput(
  * Look at BROTLI_VERSION for more information.
  */
 BROTLI_ENC_API uint32_t BrotliEncoderVersion(void);
+
+
+/**
+ * The following functions make it possible to generate and use a reduced
+ * dictionary based on a traning data set instead of using a small subset of the
+ * dictionary by default. This can significantly improve the compression of
+ * small files, including text data and web content. Note that this is only
+ * supported for some hashers, so this only has an effect for quality 5 to 9.
+ * The dictionary is most useful if it is used on many small files for each time
+ * it is loaded since loading the dictionary and initializing data structures
+ * comes at a one-time performance cost. Using a bloom filter, hash table and
+ * radix trie to optimize performance, the reduced dictionary implementation
+ * should have no or little impact on performance.
+ */
+
+/**
+ * Loads a reduced dictionary from disk and encapsulates it in a
+ * ::BrotliEncoderDict object.
+ *
+ * @p alloc_func and @p free_func @b MUST be both zero or both non-zero. In the
+ * case they are both zero, default memory allocators are used. @p opaque is
+ * passed to @p alloc_func and @p free_func when they are called. @p free_func
+ * has to return without doing anything when asked to free a NULL pointer.
+ * Due to technical and performance limitations, dictionaries with more than
+ * 6192 unique four-byte prefixes will be rejected. Currently, the function does
+ * not support custom memory allocators and will use malloc. It will fail if
+ * alloc_func or free_func are nonzero.
+ *
+ * @param alloc_func custom memory allocation function
+ * @param free_func custom memory free function
+ * @param opaque custom memory manager handle
+ * @param in_file Path for the reduced dictionary file
+ * @returns @c 0 if instance can not be allocated or reading the dictionary
+ * fails.
+ * @returns pointer to initialized ::BrotliEncoderDict otherwise
+ */
+BROTLI_ENC_API BrotliEncoderDict* BrotliEncoderLoadDict(const char* in_file,
+    brotli_alloc_func alloc_func, brotli_free_func free_func, void* opaque);
+
+/**
+ * These functions take the same role as ::BrotliEncoderLoadDict, but use
+ * malloc/free for memory allocation and a precomputed reduced dictionary for
+ * HTML/CSS/JS content. The dictionaries were generated using a large training
+ * data set featuring several languages. For data in a different format or data
+ * with majority non-english content, these functions will not perform better
+ * than the default dictionary configuration. It is recommended to generate a
+ * new dictionary for these use cases.
+ * @returns @c 0 if instance can not be allocated
+ * @returns pointer to initialized ::BrotliEncoderDict otherwise
+ */
+BROTLI_ENC_API BrotliEncoderDict* BrotliEncoderLoadHTMLDict(void);
+BROTLI_ENC_API BrotliEncoderDict* BrotliEncoderLoadCSSDict(void);
+BROTLI_ENC_API BrotliEncoderDict* BrotliEncoderLoadJSDict(void);
+
+/**
+ * Creates a ::BrotliEncoderDict object. When this object is used together with
+ * a BrotliEncoderState on several data buffers, it will be used to gather
+ * statistics on the most commonly used dictionary words. Please note that this
+ * function will not generate the dictionary itself since this can only happen
+ * after the statistics are gathered. Instead, the reduced dictionary will be
+ * generated and written to the provided file name by
+ * ::BrotliEncoderDestroyDict.
+ * It is strongly recommended to use a large number of input buffers to generate
+ * a high quality reduced dictionary that will compress files similar to the
+ * training data well. Also note that while using a reduced dictionary is
+ * threadsafe, generating it is not. The resulting BrotliEncoderDict may only be
+ * used with several BrotliEncoderState objects sequentially, not concurrently.
+ * @p alloc_func and @p free_func @b MUST be both zero or both non-zero. In the
+ * case they are both zero, default memory allocators are used. @p opaque is
+ * passed to @p alloc_func and @p free_func when they are called. @p free_func
+ * has to return without doing anything when asked to free a NULL pointer.
+ * Currently, the function does not support custom memory allocators and will
+ * use malloc. It will fail if alloc_func or free_func are nonzero.
+ *
+ * @param alloc_func custom memory allocation function
+ * @param free_func custom memory free function
+ * @param opaque custom memory manager handle
+ * @param out_file Path for the reduced dictionary file
+ * @returns @c 0 if instance can not be allocated or initialized.
+ * @returns pointer to initialized ::BrotliEncoderDict if operation succeeded.
+ * Note that this does not mean that creating the reduced dictionary succeeded,
+ * this will only happen during destruction
+ */
+BROTLI_ENC_API BrotliEncoderDict* BrotliEncoderGenerateDict(
+    const char* out_file, brotli_alloc_func alloc_func,
+    brotli_free_func free_func, void* opaque);
+
+/**
+ * Adds a ::BrotliEncoderDict to a state object so a reduced dictionary can be
+ * used or generated. Must be called before any data is processed.
+ * @returns ::BROTLI_TRUE, if operation succeeded.
+ * @returns ::BROTLI_FALSE if a BrotliEncoderDict was already added to the
+ * ::BrotliEncoderState.
+ */
+BROTLI_ENC_API BROTLI_BOOL BrotliEncoderAddDict(BrotliEncoderState* state,
+    BrotliEncoderDict* dict);
+
+/**
+ * Deinitializes and frees ::BrotliEncoderDict instance.
+ * If the dictionary was created with the generate method, this function will
+ * generate the dictionary and write it to the the disk location provided to
+ * ::BrotliEncoderGenerateDict.
+ * @param dict dictionary instance to be cleaned up and deallocated
+ * @returns BROTLI_TRUE, if operation succeeded.
+ * @returns BROTLI_FALSE if there was an issue with memory deallocation
+ * @returns BROTLI_FALSE and does not write a dictionary if no dictionary
+ * matches were found.
+ */
+BROTLI_ENC_API BROTLI_BOOL BrotliEncoderDestroyDict(BrotliEncoderDict* dict);
 
 #if defined(__cplusplus) || defined(c_plusplus)
 }  /* extern "C" */

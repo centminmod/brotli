@@ -12,6 +12,10 @@
 #include <brotli/types.h>
 #include "./static_dict_lut.h"
 
+#include "rax/rax.h"
+
+#define BROTLI_DEFAULT_DICT_SIZE 31705
+
 #if defined(__cplusplus) || defined(c_plusplus)
 extern "C" {
 #endif
@@ -32,6 +36,15 @@ typedef struct BrotliEncoderDictionary {
   /* from static_dict_lut.h, for slow encoder */
   const uint16_t* buckets;
   const DictWord* dict_words;
+
+  /* for reduced dictionary */
+  BROTLI_BOOL use_transformed_dict;
+  size_t* hist;
+  char* out_file;
+  uint32_t* hash_lookups;
+  uint8_t* bloom;
+  uint8_t* hash;
+  rax* trie;
 } BrotliEncoderDictionary;
 
 BROTLI_INTERNAL void BrotliInitEncoderDictionary(BrotliEncoderDictionary* dict);

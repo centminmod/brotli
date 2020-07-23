@@ -197,6 +197,140 @@ static BROTLI_INLINE void SearchInStaticDictionary(
   }
 }
 
+typedef struct TrieNode {
+    uint32_t value;
+    raxNode* ptr;
+} TrieNode;
+
+#define BLOOM_SIZE 16384
+#define BLOOM_ALLOC_SIZE (BLOOM_SIZE / 8)
+#define HASH_SIZE 8192
+#define HASH_MASK (HASH_SIZE - 1)
+#define HASH_ALLOC_SIZE (HASH_SIZE * sizeof(TrieNode))
+
+/* We use a hash table to look up a pointer to a node with four matching bytes
+    within the radix trie. */
+#define TRIE_NODE_PEEK 4
+
+static BROTLI_INLINE void hash_insert(TrieNode* hash, const void* data,
+    raxNode* ptr) {
+  uint32_t hval = Hash14(data) >> 1;
+  while(BROTLI_TRUE) {
+    if (hash[hval].value == 0) {
+      hash[hval].value = BROTLI_UNALIGNED_LOAD32LE(data);
+      hash[hval].ptr = ptr;
+      return;
+    }
+    if (memcmp(&hash[hval].value, data, TRIE_NODE_PEEK) == 0) {
+      return;
+    }
+    hval++;
+    hval &= HASH_MASK;
+  }
+}
+
+static BROTLI_INLINE raxNode* hash_lookup(TrieNode* hash, const void* data) {
+  uint32_t hval = Hash14(data) >> 1;
+  while(BROTLI_TRUE) {
+    if (memcmp(&hash[hval].value, data, TRIE_NODE_PEEK) == 0) {
+      return hash[hval].ptr;
+    }
+    if (hash[hval].value == 0) {
+      return 0;
+    }
+    hval++;
+    hval &= HASH_MASK;
+  }
+
+  /* Should not be reached */
+  return 0;
+}
+
+static BROTLI_INLINE void SearchInReducedDictionary(
+    const BrotliEncoderDictionary* dictionary,
+    HasherCommon* common, const uint8_t* data, size_t max_length,
+    size_t max_backward, size_t max_distance, HasherSearchResult* out,
+    score_t best_score) {
+  common->dict_num_lookups++;
+  uint32_t hval = Hash14(data);
+  /* Use a simple k=1 bloom filter to avoid a hash lookup in case hash bucket is
+     empty. */
+  if ((dictionary->bloom[hval >> 3] & (1 << (hval & 7))) == 0) {
+    return;
+  }
+
+  raxNode *stopnode = 0;
+
+  /* Use the radix trie to find the longest dict word fully matching at this
+     position. If we do not generate a dictionary and thus use a reduced
+     dict, use a hash to look up a node with TRIE_NODE_PEEK bytes matching. */
+  if (dictionary->out_file) {
+    dictionary->hash_lookups[hval]++;
+    raxNode* start_node = 0;
+    int splitpos = 0;
+    int stop = raxLowWalk(dictionary->trie, data, TRIE_NODE_PEEK, &start_node,
+        0, &splitpos, 0);
+    if (stop == TRIE_NODE_PEEK && splitpos == 0) {
+      raxLowWalk2(start_node, data + TRIE_NODE_PEEK,
+          max_length - TRIE_NODE_PEEK, &stopnode);
+    }
+  }
+  else {
+    raxNode* start_node = hash_lookup((TrieNode*)dictionary->hash, data);
+    if (start_node) {
+      raxLowWalk2(start_node, data + TRIE_NODE_PEEK,
+          max_length - TRIE_NODE_PEEK, &stopnode);
+    }
+  }
+
+  if (stopnode) {
+    DictWord w;
+    /* Retrieve the DictWord with the longest match. */
+    void* node_data = raxGetData(stopnode);
+    memcpy(&w, &node_data, 4);
+    uint32_t matches[2];
+    BrotliTransformReducedDictionaryMatch(dictionary, data,
+        max_length, matches, w);
+    size_t distance = max_backward + (matches[0] >> 5) + 1;
+    if (distance > max_distance) {
+      return;
+    }
+    size_t len_code = matches[0] & 0x1F;
+    size_t l = matches[1];
+    score_t score = BackwardReferenceScore(l, distance);
+
+#ifdef CHECK_MATCH
+    const size_t local_offset = dictionary->words->offsets_by_length[l] + l
+        * w.idx;
+    if (len_code == l && w.transform == 0 && memcmp(data,
+        &dictionary->words->data[local_offset], l) != 0) {
+      char word_buf[l + 1];
+      word_buf[l] = '\0';
+      memcpy(word_buf, &dictionary->words->data[local_offset], l);
+      printf("failing l: %zu cur_ix: %zu word: %s\n", l, cur_ix, word_buf);
+      memcpy(word_buf, data, l);
+      printf("failing l: %zu cur_ix: %zu word: %s\n", l, cur_ix, word_buf);
+      exit(1);
+    }
+#endif
+    if (best_score < score) {
+      out->len = l;
+      out->len_code_delta = (int)len_code - (int)l;
+      out->distance = distance;
+      out->score = score;
+      common->dict_num_matches++;
+      if (dictionary->out_file) {
+        /* Use hist to keep track of the saved bits for each DictWord according
+           to the cost model. */
+        dictionary->hist[((w.transform / 10) << 16) + (len_code << 11) + w.idx]
+          += score - best_score;
+        /* index 0 is unused, use it for the sum for all words. */
+        dictionary->hist[0] += score - best_score;
+      }
+    }
+  }
+}
+
 typedef struct BackwardMatch {
   uint32_t distance;
   uint32_t length_and_code;

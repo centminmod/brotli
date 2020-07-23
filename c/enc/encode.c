@@ -9,11 +9,14 @@
 #include <brotli/encode.h>
 
 #include <stdlib.h>  /* free, malloc */
+#include <stdio.h>  /* fclose, fopen, fread, fseek, fwrite, rewind */
 #include <string.h>  /* memcpy, memset */
+#include <sys/errno.h>
 
 #include "../common/constants.h"
 #include "../common/context.h"
 #include "../common/platform.h"
+#include "../common/transform.h"
 #include "../common/version.h"
 #include "./backward_references.h"
 #include "./backward_references_hq.h"
@@ -30,6 +33,7 @@
 #include "./metablock.h"
 #include "./prefix.h"
 #include "./quality.h"
+#include "./reduced_dict.h"
 #include "./ringbuffer.h"
 #include "./utf8_util.h"
 #include "./write_bits.h"
@@ -127,6 +131,22 @@ typedef struct BrotliEncoderStateStruct {
   BROTLI_BOOL is_last_block_emitted_;
   BROTLI_BOOL is_initialized_;
 } BrotliEncoderStateStruct;
+
+/*Encapsulates data to use or generate a reduced dictionary across
+  BrotliEncoderState objects. */
+typedef struct BrotliEncoderExternalDict {
+  MemoryManager memory_manager_;
+  const BrotliDictionary* words;
+  const DictWord* dict_words;
+
+  size_t* hist;
+  uint32_t* hash_lookups;
+  char* out_file;
+
+  uint8_t* bloom;
+  uint8_t* hash;
+  rax* trie;
+} BrotliEncoderExternalDict;
 
 static size_t InputBlockSize(BrotliEncoderState* s) {
   return (size_t)1 << s->params.lgblock;
@@ -838,6 +858,514 @@ void BrotliEncoderDestroyInstance(BrotliEncoderState* state) {
     BrotliEncoderCleanupState(state);
     free_func(opaque, state);
   }
+}
+
+static BROTLI_BOOL BrotliInitReducedDict(BrotliEncoderExternalDict* dictionary,
+  const DictWord* dict_words, int dict_size) {
+  dictionary->trie = raxNew();
+  if (!dictionary->trie){
+    return BROTLI_FALSE;
+  }
+  uint32_t num_prefixes = 0;
+
+  uint8_t word_buf[BROTLI_MAX_DEFAULT_DICTIONARY_WORD];
+  const BrotliTransforms* transforms = BrotliGetTransforms();
+  for(int i = 1; i < dict_size; i++) {
+    /* Find and insert each DictWord into the radix trie */
+    DictWord w = dict_words[i];
+    const size_t l = w.len & 0x1F;
+
+    const size_t local_offset = dictionary->words->offsets_by_length[l] + l
+        * w.idx;
+    int transform_idx = 0;
+    if (w.transform == BROTLI_TRANSFORM_UPPERCASE_FIRST) {
+      transform_idx = 9;
+    }
+    if (w.transform == BROTLI_TRANSFORM_UPPERCASE_ALL) {
+      transform_idx = 44;
+    }
+    BrotliTransformDictionaryWord(word_buf,
+      &dictionary->words->data[local_offset], l, transforms,
+      transform_idx);
+
+    /* Add dummy nodes so we can access a node TRIE_NODE_PEEK bytes in despite
+      compression. */
+    int result = raxTryInsert(dictionary->trie, word_buf, TRIE_NODE_PEEK, 0, 0);
+    if (result == 1) {
+      num_prefixes++;
+      /* When we are not using the full dict we use a reduced dict and a hash.
+         Avoid having a load factor of more than 0.75. */
+      if (num_prefixes > HASH_SIZE * 3 / 4 &&
+        dict_size != BROTLI_DEFAULT_DICT_SIZE) {
+        raxFree(dictionary->trie);
+        return BROTLI_FALSE;
+      }
+    }
+    else if (result == 0 && errno == ENOMEM) {
+      /* Out of memory */
+      raxFree(dictionary->trie);
+      return BROTLI_FALSE;
+    }
+
+    void* dummy = 0;
+    memcpy(&dummy, &w, 4);
+    result = raxInsert(dictionary->trie, word_buf, l, dummy, 0);
+    if (result == 0 && errno == ENOMEM) {
+      /* Out of memory */
+      raxFree(dictionary->trie);
+      return BROTLI_FALSE;
+    }
+
+    /* Cut transform */
+    if (w.transform == 0 && l >= 5) {
+      w.transform = 1;
+      memcpy(&dummy, &w, 4);
+      result = raxTryInsert(dictionary->trie, word_buf, l - 1, dummy, 0);
+      if (result == 0 && errno == ENOMEM) {
+        /* Out of memory */
+        raxFree(dictionary->trie);
+        return BROTLI_FALSE;
+      }
+    }
+
+    uint32_t hval = Hash14((uint8_t*)word_buf);
+    /* Initialize bloom filter */
+    dictionary->bloom[hval >> 3] |= (1 << (hval & 7));
+  }
+
+  /* Fill hash table used to look up pointers within trie */
+  if (!dictionary->out_file) {
+    for(int i = 1; i < dict_size; i++) {
+      DictWord w = dict_words[i];
+      const size_t l = w.len & 0x1F;
+
+      const size_t local_offset = dictionary->words->offsets_by_length[l] +
+          l * w.idx;
+      int transform_idx = 0;
+      if (w.transform == BROTLI_TRANSFORM_UPPERCASE_FIRST) {
+        transform_idx = 9;
+      }
+      if (w.transform == BROTLI_TRANSFORM_UPPERCASE_ALL) {
+        transform_idx = 44;
+      }
+      BrotliTransformDictionaryWord(word_buf,
+        &dictionary->words->data[local_offset], l, transforms,
+        transform_idx);
+
+      raxNode* conv_val = 0;
+      raxLowWalk(dictionary->trie, word_buf, TRIE_NODE_PEEK,
+          &conv_val, 0, 0, 0);
+      hash_insert((TrieNode*)dictionary->hash, word_buf, conv_val);
+    }
+  }
+
+  return BROTLI_TRUE;
+}
+
+static BrotliEncoderDict* BrotliEncoderAllocDict(brotli_alloc_func alloc_func,
+    brotli_free_func free_func, void* opaque) {
+  BrotliEncoderExternalDict* dict = 0;
+  /* TODO: Add support for other alloc functions in trie allocation. For now,
+     just fail when a different allocation function is used. */
+  if (alloc_func || free_func) {
+    return 0;
+  }
+  if (!alloc_func && !free_func) {
+    dict = (BrotliEncoderExternalDict*)malloc(
+        sizeof(BrotliEncoderExternalDict));
+  } else if (alloc_func && free_func) {
+    dict = (BrotliEncoderExternalDict*)alloc_func(opaque,
+        sizeof(BrotliEncoderExternalDict));
+  }
+  if (dict == 0) {
+    /* BROTLI_DUMP(); */
+    return 0;
+  }
+
+  BrotliInitMemoryManager(
+      &dict->memory_manager_, alloc_func, free_func, opaque);
+
+  dict->words = BrotliGetDictionary();
+  dict->dict_words = kStaticDictionaryWords;
+  return dict;
+}
+
+/* TODO: There is some duplication between this function and the disk-based load
+   function, consider merging them. */
+static BrotliEncoderDict* BrotliEncoderLoadReducedDict(
+    const uint16_t* included_words, uint16_t reduced_dict_size) {
+  BrotliEncoderExternalDict* dict = BrotliEncoderAllocDict(0, 0, 0);
+  if (!dict) {
+    /* BROTLI_DUMP(); */
+    return 0;
+  }
+
+  MemoryManager* m = &dict->memory_manager_;
+
+  DictWord* new_dict_words = BROTLI_ALLOC(m, DictWord, reduced_dict_size + 1);
+  if (BROTLI_IS_OOM(m) || BROTLI_IS_NULL(new_dict_words)) {
+    return 0;
+  }
+
+  /* Construct new dictionary words based on existing table and buckets. Word at
+     position zero is unused. The file contains the indices of the words we want
+     to include in the reduced dictionary. */
+  uint16_t prev_idx = 0;
+  for (uint32_t i = 0; i < reduced_dict_size; i++) {
+    uint16_t idx = included_words[i];
+    if (idx == 0 || idx >= BROTLI_DEFAULT_DICT_SIZE || idx <= prev_idx) {
+      /* Indices are corrupted */
+      BROTLI_FREE(m, new_dict_words);
+      free(dict);
+      return 0;
+    }
+    new_dict_words[i + 1] = dict->dict_words[idx];
+    prev_idx = idx;
+  }
+
+  dict->out_file = NULL;
+  dict->bloom = BROTLI_ALLOC(m, uint8_t, BLOOM_ALLOC_SIZE);
+  dict->hash = BROTLI_ALLOC( m, uint8_t, HASH_ALLOC_SIZE);
+  if (BROTLI_IS_OOM(m) || BROTLI_IS_NULL(dict->bloom) ||
+          BROTLI_IS_NULL(dict->hash)) {
+    return 0;
+  }
+  memset(dict->bloom, 0, BLOOM_ALLOC_SIZE);
+  memset(dict->hash, 0, HASH_ALLOC_SIZE);
+  if (BrotliInitReducedDict(dict, new_dict_words, 1 + reduced_dict_size)
+      != BROTLI_TRUE) {
+    BROTLI_FREE(m, dict->bloom);
+    BROTLI_FREE(m, dict->hash);
+    BROTLI_FREE(m, new_dict_words);
+    free(dict);
+    return 0;
+  }
+  BROTLI_FREE(m, new_dict_words);
+
+  return dict;
+}
+
+/* Load precomputed dictionaries for web data*/
+BrotliEncoderDict* BrotliEncoderLoadHTMLDict(void) {
+  uint16_t reduced_dict_size = sizeof(kStaticHtmlDict) / sizeof(uint16_t);
+  return BrotliEncoderLoadReducedDict(kStaticHtmlDict, reduced_dict_size);
+}
+
+BrotliEncoderDict* BrotliEncoderLoadCSSDict(void) {
+  uint16_t reduced_dict_size = sizeof(kStaticCssDict) / sizeof(uint16_t);
+  return BrotliEncoderLoadReducedDict(kStaticCssDict, reduced_dict_size);
+}
+
+BrotliEncoderDict* BrotliEncoderLoadJSDict(void) {
+  uint16_t reduced_dict_size = sizeof(kStaticJsDict) / sizeof(uint16_t);
+  return BrotliEncoderLoadReducedDict(kStaticJsDict, reduced_dict_size);
+}
+
+BrotliEncoderDict* BrotliEncoderLoadDict(const char* in_file,
+    brotli_alloc_func alloc_func, brotli_free_func free_func, void* opaque) {
+  BrotliEncoderExternalDict* dict = BrotliEncoderAllocDict(alloc_func,
+    free_func, opaque);
+  if (!dict) {
+    /* BROTLI_DUMP(); */
+    return 0;
+  }
+
+  MemoryManager* m = &dict->memory_manager_;
+
+  FILE* dict_fp = fopen(in_file, "rb");
+  if (!dict_fp) {
+    return 0;
+  }
+
+  if (fseek(dict_fp, 0L, SEEK_END) != 0) {
+    fclose(dict_fp);
+    return 0;
+  }
+
+  /* File size must be positive and indicate a subset of the dictionary */
+  int64_t reduced_dict_size = ftell(dict_fp) / 2;
+  if (reduced_dict_size == 0 ||
+      reduced_dict_size > BROTLI_DEFAULT_DICT_SIZE - 2) {
+    fclose(dict_fp);
+    return 0;
+  }
+  rewind(dict_fp);
+
+  uint16_t* included_words = BROTLI_ALLOC(m, uint16_t, reduced_dict_size);
+  DictWord* new_dict_words = BROTLI_ALLOC(m, DictWord, reduced_dict_size + 1);
+  if (BROTLI_IS_OOM(m) || BROTLI_IS_NULL(included_words) ||
+          BROTLI_IS_NULL(new_dict_words)) {
+    return 0;
+  }
+
+  if (fread(included_words, 2, (size_t)reduced_dict_size, dict_fp) !=
+        (size_t)reduced_dict_size) {
+    fclose(dict_fp);
+    return 0;
+  }
+  fclose(dict_fp);
+
+  /* Construct new dictionary words based on existing table and buckets. Word at
+     position zero is unused. The file contains the indices of the words we want
+     to include in the reduced dictionary. */
+  uint16_t prev_idx = 0;
+  for (uint32_t i = 0; i < reduced_dict_size; i++) {
+    uint16_t idx = included_words[i];
+    if (idx == 0 || idx >= BROTLI_DEFAULT_DICT_SIZE || idx <= prev_idx) {
+      /* Indices are corrupted */
+      BROTLI_FREE(m, included_words);
+      BROTLI_FREE(m, new_dict_words);
+      void* opaque = m->opaque;
+      free_func(opaque, dict);
+      return 0;
+    }
+    new_dict_words[i + 1] = dict->dict_words[idx];
+    prev_idx = idx;
+  }
+
+  dict->out_file = NULL;
+
+  BROTLI_FREE(m, included_words);
+  dict->bloom = BROTLI_ALLOC(m, uint8_t, BLOOM_ALLOC_SIZE);
+  dict->hash = BROTLI_ALLOC( m, uint8_t, HASH_ALLOC_SIZE);
+  if (BROTLI_IS_OOM(m) || BROTLI_IS_NULL(dict->bloom) ||
+          BROTLI_IS_NULL(dict->hash)) {
+    return 0;
+  }
+  memset(dict->bloom, 0, BLOOM_ALLOC_SIZE);
+  memset(dict->hash, 0, HASH_ALLOC_SIZE);
+  if (BrotliInitReducedDict(dict, new_dict_words, 1 + reduced_dict_size)
+      != BROTLI_TRUE) {
+    BROTLI_FREE(m, dict->bloom);
+    BROTLI_FREE(m, dict->hash);
+    BROTLI_FREE(m, new_dict_words);
+    void* opaque = m->opaque;
+    free_func(opaque, dict);
+    return 0;
+  }
+  BROTLI_FREE(m, new_dict_words);
+
+  return dict;
+}
+
+BrotliEncoderDict* BrotliEncoderGenerateDict(const char* out_file,
+  brotli_alloc_func alloc_func, brotli_free_func free_func, void* opaque) {
+  BrotliEncoderExternalDict* dict = BrotliEncoderAllocDict(alloc_func,
+    free_func, opaque);
+  if (!dict) {
+    /* BROTLI_DUMP(); */
+    return 0;
+  }
+
+  size_t fname_len = strnlen(out_file, 128);
+  if (fname_len == 128) {
+    return 0;
+  }
+
+  /* The dictionary generation only happens when the dictionary object is
+     destroyed after statistics are gathered during compression, so just
+     allocate objects at this point. */
+  MemoryManager* m = &dict->memory_manager_;
+  dict->hist = BROTLI_ALLOC(m, size_t, 65536 * 3);
+  dict->hash_lookups = BROTLI_ALLOC(m, uint32_t, 32768);
+  dict->out_file = BROTLI_ALLOC(m, char, 128);
+  dict->bloom = BROTLI_ALLOC(m, uint8_t, BLOOM_ALLOC_SIZE);
+  dict->hash = BROTLI_ALLOC(m, uint8_t, HASH_ALLOC_SIZE);
+  if (BROTLI_IS_OOM(m) || BROTLI_IS_NULL(dict->hist) ||
+      BROTLI_IS_NULL(dict->hash_lookups) ||
+      BROTLI_IS_NULL(dict->out_file) ||
+      BROTLI_IS_NULL(dict->bloom) ||
+      BROTLI_IS_NULL(dict->hash)) {
+    return 0;
+  }
+  memset(dict->hist, 0, 65536 * 3);
+  memset(dict->hash_lookups, 0, 32768);
+  memcpy(dict->out_file, out_file, fname_len + 1);
+  memset(dict->bloom, 0, BLOOM_ALLOC_SIZE);
+  memset(dict->hash, 0, HASH_ALLOC_SIZE);
+  if (BrotliInitReducedDict(dict, dict->dict_words, BROTLI_DEFAULT_DICT_SIZE)
+      != BROTLI_TRUE) {
+    BROTLI_FREE(m, dict->bloom);
+    BROTLI_FREE(m, dict->hash);
+    BROTLI_FREE(m, dict->hist);
+    BROTLI_FREE(m, dict->hash_lookups);
+    BROTLI_FREE(m, dict->out_file);
+    void* opaque = m->opaque;
+    free_func(opaque, dict);
+    return 0;
+  }
+
+  return dict;
+}
+
+BROTLI_BOOL BrotliEncoderAddDict(BrotliEncoderState* state,
+                                 BrotliEncoderDict* external_dict) {
+  BrotliEncoderDictionary* dict = &state->params.dictionary;
+  if (dict->use_transformed_dict == BROTLI_FALSE) {
+    /* Shallow copying these structures allows us to use the same
+       BrotliEncoderDict with several encoder objects without any additional
+       memory usage. */
+    dict->use_transformed_dict = BROTLI_TRUE;
+    dict->hist = external_dict->hist;
+    dict->hash_lookups = external_dict->hash_lookups;
+    dict->out_file = external_dict->out_file;
+    dict->bloom = external_dict->bloom;
+    dict->hash = external_dict->hash;
+    dict->trie = external_dict->trie;
+    return BROTLI_TRUE;
+  }
+
+  return BROTLI_FALSE;
+}
+
+static BROTLI_BOOL BrotliSaveReducedDict(BrotliEncoderDict* dict) {
+  /* Generate a subset of the dictionary that still allows us to get most of the
+     matches on the training data. We not only look at the number of bytes saved
+     per dict word, but also consider the number of lookups word's hash and the
+     frequency of other words with the same hash. This allows us to excludes
+     words that are unlikely to occur or make hash lookups considerably slower
+     without improving compression much. */
+  if (dict->out_file) {
+    /* 240 is equivalent to one byte saved in the cost model. While converting
+       to saved bytes is not necessary based on the current way we determine
+       which positions to include, it makes gathering statistics and future
+       changes easier. */
+    size_t total_count = dict->hist[0] / 240;
+    if (!total_count) {
+      return BROTLI_FALSE;
+    }
+    /* This cutoff works reasonably well. If there are less than 128000 saved
+       bytes in the histogram, generating a reduced dictionary is probably a bad
+       idea, but we still don't want to include every word in that case. */
+    size_t total_count_cutoff = BROTLI_MAX(size_t, 1, total_count / 128000);
+    (void)total_count_cutoff;
+    FILE* out_dict_fp = fopen(dict->out_file, "wb");
+
+    uint8_t word_buf[BROTLI_MAX_DEFAULT_DICTIONARY_WORD];
+    const BrotliTransforms* transforms = BrotliGetTransforms();
+
+    uint32_t bucket_start = 0;
+    uint32_t bucket_end = 1;
+    for (uint16_t i = 1; i < BROTLI_DEFAULT_DICT_SIZE; i++) {
+      DictWord w = dict->dict_words[i];
+      size_t idx = w.idx;
+      size_t l = (w.len & 127);
+      if (bucket_end > 0) {
+        bucket_start = i;
+      }
+      bucket_end = 0;
+      if (w.len & 128) {
+        bucket_end = 1;
+      }
+
+      int transform_idx = 0;
+      size_t transform = 0;
+      if (w.transform == BROTLI_TRANSFORM_UPPERCASE_FIRST) {
+        transform = 1;
+        transform_idx = 9;
+      }
+      else if (w.transform == BROTLI_TRANSFORM_UPPERCASE_ALL) {
+        transform = 2;
+        transform_idx = 44;
+      }
+
+      size_t position = (transform << 16) + (l << 11) + idx;
+      const size_t local_offset = dict->words->offsets_by_length[l] + l * idx;
+
+      BrotliTransformDictionaryWord(word_buf,
+        &dict->words->data[local_offset], l, transforms,
+        transform_idx);
+
+      uint32_t hash_val = Hash14(word_buf);
+      uint32_t hash_count_bloom = dict->hash_lookups[hash_val];
+      uint32_t hash_count_trie = dict->hash_lookups[hash_val] +
+          dict->hash_lookups[hash_val ^ 1];
+      hash_count_trie/=2;
+
+      /* This rounds down, decreasing accuracy, but for words that are not rare
+         it won't make a difference. */
+      size_t count = dict->hist[position] / 240;
+
+      size_t bucket_count = 0;
+      uint16_t k = bucket_start;
+
+      while (k < BROTLI_DEFAULT_DICT_SIZE) {
+        DictWord w2 = dict->dict_words[k];
+        size_t idx2 = w2.idx;
+        size_t l2 = (w2.len & 127);
+
+        size_t transform2 = 0;
+        if (w2.transform == BROTLI_TRANSFORM_UPPERCASE_FIRST) {
+          transform2 = 1;
+        }
+        else if (w2.transform == BROTLI_TRANSFORM_UPPERCASE_ALL) {
+          transform2 = 2;
+        }
+        size_t position2 = (transform2 << 16) + (l2 << 11) + idx2;
+        bucket_count += dict->hist[position2] / 240;
+
+        if (w2.len & 128) {
+          break;
+        }
+
+        k++;
+      }
+      size_t score = count;
+      /* Exclude words that are only a small fraction of their bucket and thus
+         slow down lookups of other, more frequent words. */
+      if (score < bucket_count / 36) {
+        score = 0;
+      }
+
+      if (hash_count_trie > bucket_count * 17) {
+        score = 0;
+      }
+
+      if (hash_count_trie > count * 38) {
+        score = 0;
+      }
+
+      if (hash_count_bloom > bucket_count * 30) {
+        score = 0;
+      }
+
+      if (score > 100) {
+        fwrite(&i, 2, 1, out_dict_fp);
+      }
+    }
+    fclose(out_dict_fp);
+  }
+  return BROTLI_TRUE;
+}
+
+BROTLI_BOOL BrotliEncoderDestroyDict(BrotliEncoderDict* dict) {
+  if (!dict) {
+    return BROTLI_FALSE;
+  }
+
+  if (!BrotliSaveReducedDict(dict)) {
+    return BROTLI_FALSE;
+  }
+
+  MemoryManager* m = &dict->memory_manager_;
+  if (BROTLI_IS_OOM(m)) {
+    BrotliWipeOutMemoryManager(m);
+    return BROTLI_FALSE;
+  }
+
+  if (dict->out_file) {
+    BROTLI_FREE(m, dict->hist);
+    BROTLI_FREE(m, dict->hash_lookups);
+    BROTLI_FREE(m, dict->out_file);
+  }
+  BROTLI_FREE(m, dict->bloom);
+  BROTLI_FREE(m, dict->hash);
+  raxFree(dict->trie);
+
+  brotli_free_func free_func = m->free_func;
+  void* opaque = m->opaque;
+  free_func(opaque, dict);
+  return BROTLI_TRUE;
 }
 
 /*

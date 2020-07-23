@@ -257,7 +257,21 @@ static BROTLI_INLINE void FN(FindLongestMatch)(
     bucket[num[key] & self->block_mask_] = (uint32_t)cur_ix;
     ++num[key];
   }
-  if (min_score == out->score) {
+
+  /* When a reduced dictionary is available, use it when there is no match or a
+     short/expensive match according to the cost model. */
+  if(dictionary->use_transformed_dict == BROTLI_TRUE){
+    if(max_length >= 4 &&
+        best_score < (BROTLI_SCORE_BASE + BROTLI_LITERAL_BYTE_SCORE * 3) &&
+        /* Stop searching the dict if there are few matches per lookup, this
+           speeds up large files where the dict is only useful at the start. */
+        self->common_->dict_num_matches >=
+        (self->common_->dict_num_lookups >> 8)) {
+      SearchInReducedDictionary(dictionary, self->common_, &data[cur_ix_masked],
+          max_length, dictionary_distance, max_distance, out, best_score);
+    }
+  }
+  else if (min_score == out->score) {
     SearchInStaticDictionary(dictionary,
         self->common_, &data[cur_ix_masked], max_length, dictionary_distance,
         max_distance, out, BROTLI_FALSE);

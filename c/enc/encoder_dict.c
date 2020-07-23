@@ -26,6 +26,17 @@ void BrotliInitEncoderDictionary(BrotliEncoderDictionary* dict) {
 
   dict->cutoffTransformsCount = kCutoffTransformsCount;
   dict->cutoffTransforms = kCutoffTransforms;
+
+  /* These fields are only used for the reduced dictionary and may be
+     initialized later. */
+  dict->use_transformed_dict = BROTLI_FALSE;
+  dict->hist = NULL;
+  dict->hash_lookups = NULL;
+  dict->out_file = NULL;
+
+  dict->bloom = NULL;
+  dict->hash = NULL;
+  dict->trie = NULL;
 }
 
 #if defined(__cplusplus) || defined(c_plusplus)
