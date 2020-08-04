@@ -863,7 +863,7 @@ void BrotliEncoderDestroyInstance(BrotliEncoderState* state) {
 static BROTLI_BOOL BrotliInitReducedDict(BrotliEncoderExternalDict* dictionary,
   const DictWord* dict_words, int dict_size) {
   dictionary->trie = raxNew();
-  if (!dictionary->trie){
+  if (!dictionary->trie) {
     return BROTLI_FALSE;
   }
   uint32_t num_prefixes = 0;
